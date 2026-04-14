@@ -1,0 +1,340 @@
+name: Security
+
+on:
+  push:
+    branches:
+      - sec-semgrep
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Opengrep — SAST (any language)
+  # Open source, no limits, 30+ languages
+  # ─────────────────────────────────────────────
+  opengrep:
+    name: Opengrep (SAST)
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Opengrep
+        env:
+          OPENGREP_VERSION: v1.18.0
+        run: |
+          wget -q "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_x86" \
+            -O /usr/local/bin/opengrep
+          chmod +x /usr/local/bin/opengrep
+          opengrep --version
+
+      - name: Run Opengrep
+        run: |
+          opengrep scan \
+            --config auto \
+            --config p/php \
+            --config p/owasp-top-ten \
+            --sarif \
+            --output opengrep.sarif \
+            . || true
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opengrep-sarif
+          path: opengrep.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 2: Gitleaks — secrets scan
+  # ─────────────────────────────────────────────
+  gitleaks:
+    name: Gitleaks (Secrets Scan)
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Gitleaks (SARIF)
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/repo \
+          zricethezav/gitleaks:latest detect \
+          --source=/repo \
+          --report-format sarif \
+          --report-path=/repo/gitleaks.sarif \
+          --exit-code=0
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-sarif-report
+          path: gitleaks.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 3: Trivy Filesystem — SCA (any language)
+  # Replaces Snyk — open source, no limits
+  # Supports: PHP, Python, JS, Go, Java, Ruby, Rust, .NET
+  # ─────────────────────────────────────────────
+  trivy-sca:
+    name: Trivy SCA (Dependency Scan)
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan (SARIF report)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 0
+          scanners: vuln
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-sarif
+          path: trivy-fs.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 4: Trivy Container — image scan
+  # Runs after Phase 1 gates pass
+  # ─────────────────────────────────────────────
+  trivy-container:
+    name: Build & Trivy Container Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_SANDBOX }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_SANDBOX }}
+          aws-region: ${{ secrets.AWS_REGION_SANDBOX }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fetch .env from AWS Secrets Manager
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws secretsmanager get-secret-value \
+            --secret-id ${{ secrets.SECRET_NAME_SANDBOX }} \
+            --query SecretString \
+            --output text > .env
+          echo "SENTRY_RELEASE=${{ github.sha }}" >> .env
+          echo "image=$ECR_REGISTRY/${{ secrets.ECR_REPOSITORY_SANDBOX }}:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/dockerfileAppSandbox
+          load: true
+          push: false
+          tags: sandbox:${{ github.sha }}
+          cache-from: type=gha,scope=sandbox
+          cache-to: type=gha,mode=max,scope=sandbox
+
+      - name: Trivy container scan (SARIF report)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sandbox:${{ github.sha }}
+          format: sarif
+          output: trivy-container.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-sarif
+          path: trivy-container.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 5: ZAP — DAST scan
+  # Runs after container scan passes
+  # ─────────────────────────────────────────────
+  zap-scan:
+    name: OWASP ZAP (DAST)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          target: "https://sandbox.eindexamensite.nl"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_action: false
+          cmd_options: '-x zap-report.xml'
+
+      - name: Upload XML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-xml-report
+          path: zap-report.xml
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 6: Upload to DefectDojo
+  # Centralised vulnerability management
+  # Runs after all gates complete (pass or fail)
+  # ─────────────────────────────────────────────
+  defectdojo:
+    name: Upload to DefectDojo
+    runs-on: ubuntu-latest
+    needs: [opengrep, gitleaks, trivy-sca, trivy-container, zap-scan]
+    if: always() && github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Download Opengrep SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: opengrep-sarif
+          path: reports/
+
+      - name: Download Gitleaks SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-sarif-report
+          path: reports/
+
+      - name: Download Trivy SCA SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-fs-sarif
+          path: reports/
+
+      - name: Download Trivy Container SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-container-sarif
+          path: reports/
+
+      - name: Download ZAP report
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-xml-report
+          path: reports/
+
+      - name: Push Opengrep findings to DefectDojo
+        run: |
+          curl -X POST \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "file=@reports/opengrep.sarif" \
+            -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT_OPENGREP_ID }}" \
+            -F "product_name=${{ secrets.DEFECTDOJO_PRODUCT_NAME }}" \
+            -F "verified=false" \
+            -F "active=true" \
+            -F "close_old_findings=true" \
+            -F "deduplication_on_engagement=true" \
+            -F "tags=opengrep,sast" \
+            -F "build_id=${{ github.run_id }}" \
+            -F "commit_hash=${{ github.sha }}" \
+            -F "branch_tag=${{ github.ref_name }}"
+
+      - name: Push Gitleaks findings to DefectDojo
+        run: |
+          curl -X POST \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "file=@reports/gitleaks.sarif" \
+            -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT_GITLEAKS_ID }}" \
+            -F "product_name=${{ secrets.DEFECTDOJO_PRODUCT_NAME }}" \
+            -F "verified=false" \
+            -F "active=true" \
+            -F "close_old_findings=true" \
+            -F "deduplication_on_engagement=true" \
+            -F "tags=gitleaks,secrets" \
+            -F "build_id=${{ github.run_id }}" \
+            -F "commit_hash=${{ github.sha }}" \
+            -F "branch_tag=${{ github.ref_name }}"
+
+      - name: Push Trivy SCA findings to DefectDojo
+        run: |
+          curl -X POST \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "file=@reports/trivy-fs.sarif" \
+            -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT_TRIVY_SCA_ID }}" \
+            -F "product_name=${{ secrets.DEFECTDOJO_PRODUCT_NAME }}" \
+            -F "verified=false" \
+            -F "active=true" \
+            -F "close_old_findings=true" \
+            -F "deduplication_on_engagement=true" \
+            -F "tags=trivy,sca" \
+            -F "build_id=${{ github.run_id }}" \
+            -F "commit_hash=${{ github.sha }}" \
+            -F "branch_tag=${{ github.ref_name }}"
+
+      - name: Push Trivy Container findings to DefectDojo
+        run: |
+          curl -X POST \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "file=@reports/trivy-container.sarif" \
+            -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT_TRIVY_ID }}" \
+            -F "product_name=${{ secrets.DEFECTDOJO_PRODUCT_NAME }}" \
+            -F "verified=false" \
+            -F "active=true" \
+            -F "close_old_findings=true" \
+            -F "deduplication_on_engagement=true" \
+            -F "tags=trivy,container" \
+            -F "build_id=${{ github.run_id }}" \
+            -F "commit_hash=${{ github.sha }}" \
+            -F "branch_tag=${{ github.ref_name }}"
+
+      - name: Push ZAP findings to DefectDojo
+        run: |
+          curl -X POST \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=ZAP Scan" \
+            -F "file=@reports/zap-report.xml" \
+            -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT_ZAP_ID }}" \
+            -F "product_name=${{ secrets.DEFECTDOJO_PRODUCT_NAME }}" \
+            -F "verified=false" \
+            -F "active=true" \
+            -F "close_old_findings=true" \
+            -F "deduplication_on_engagement=true" \
+            -F "tags=zap,dast" \
+            -F "build_id=${{ github.run_id }}" \
+            -F "commit_hash=${{ github.sha }}" \
+            -F "branch_tag=${{ github.ref_name }}"
