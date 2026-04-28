@@ -3,7 +3,7 @@ name: Security
 on:
   push:
     branches:
-      - sec-semgrep
+      - sandbox
 
 permissions:
   contents: read
@@ -68,6 +68,7 @@ jobs:
           docker run --rm -v ${{ github.workspace }}:/repo \
           zricethezav/gitleaks:latest detect \
           --source=/repo \
+          --no-git \
           --report-format sarif \
           --report-path=/repo/gitleaks.sarif \
           --exit-code=0
